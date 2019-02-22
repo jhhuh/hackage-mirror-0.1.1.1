@@ -22,7 +22,7 @@ server or S3 bucket. An S3 bucket can be a cost effective way of
 serving a hackage mirror.
 -}
 
-module Hackage.Mirror (Options(..), mirrorHackage)
+module Hackage.Mirror -- (Options(..), mirrorHackage)
        where
 
 import qualified Aws as Aws
@@ -62,6 +62,7 @@ import Control.Exception.Lifted ( SomeException, try, finally )
 import Control.Monad ( void, when, unless, mfilter )
 import Control.Monad.Catch ( MonadMask )
 import Control.Monad.IO.Class ( MonadIO(..) )
+import Control.Monad.IO.Unlift ( MonadUnliftIO )
 import Control.Monad.Logger
     ( MonadLogger, logWarn, logInfo, logError, logDebug )
 import Control.Monad.Morph ( MonadTrans(lift), MFunctor(hoist) )
@@ -72,14 +73,14 @@ import Control.Monad.Trans.Resource
       MonadResource(..),
       MonadThrow,
       transResourceT,
-      monadThrow,
+      throwM,
       runResourceT )
 import Control.Retry ( retrying )
 import qualified Crypto.Hash.SHA512 as SHA512 ( hashlazy )
 import Data.ByteString ( ByteString )
 import qualified Data.ByteString.Lazy as BL
     ( ByteString, null, fromChunks )
-import Data.Conduit ( Source, yield, unwrapResumable, ($=), ($$) )
+import Data.Conduit ( ConduitT, yield, ($=), runConduit, (.|), transPipe )
 import qualified Data.Conduit.Binary as CB
     ( sourceLbs, sourceFile, sinkLbs, sinkFile )
 import qualified Data.Conduit.Lazy as CL
@@ -103,7 +104,7 @@ import Network.HTTP.Conduit
       newManager,
       tlsManagerSettings,
       http,
-      parseUrl )
+      parseUrlThrow )
 import System.Directory ( doesFileExist, createDirectoryIfMissing )
 import System.FilePath
     ( splitDirectories, addExtension, takeDirectory, (</>) )
@@ -143,8 +144,8 @@ pathKind url
     | otherwise = FilePath
 
 indexPackages :: (MonadLogger m, MonadThrow m, MonadBaseControl IO m,
-                  CL.MonadActive m)
-              => Source m ByteString -> Source m Package
+                  CL.MonadActive m, MonadUnliftIO m)
+              => ConduitT () ByteString m () -> ConduitT () Package m ()
 indexPackages src = do
     lbs <- lift $ CL.lazyConsume src
     sinkEntries $ Tar.read (BL.fromChunks lbs)
@@ -162,30 +163,28 @@ indexPackages src = do
         | otherwise = sinkEntries entries
     sinkEntries Tar.Done = return ()
     sinkEntries (Tar.Fail e) =
-        monadThrow $ userError $ "Failed to read tar file: " ++ show e
+        throwM $ userError $ "Failed to read tar file: " ++ show e
 
-downloadFromPath :: MonadResource m => String -> String -> Source m ByteString
+downloadFromPath :: MonadResource m => String -> String -> ConduitT () ByteString m ()
 downloadFromPath path file = do
     let p = path </> file
     exists <- liftIO $ doesFileExist p
     when exists $ CB.sourceFile p
 
-downloadFromUrl :: (MonadResource m, MonadBaseControl IO m,
+downloadFromUrl :: (MonadResource m, --MonadBaseControl IO m,
                     MonadThrow m)
-                => Manager -> String -> String -> Source m ByteString
+                => Manager -> String -> String -> ConduitT () ByteString m ()
 downloadFromUrl mgr path file = do
-    req  <- lift $ parseUrl (path </> file)
+    req  <- lift $ parseUrlThrow (path </> file)
     resp <- lift $ http req mgr
-    (src, _fin) <- lift $ unwrapResumable (responseBody resp)
-    -- jww (2013-11-20): What to do with fin?
-    src
+    responseBody resp
 
-withS3 :: MonadResource m
+withS3 :: (MonadResource m, MonadThrow m)
        => Aws.Bucket -> String -> (Aws.Bucket -> String -> m a) -> m a
 withS3 url file f = case splitDirectories (T.unpack url) of
     ["s3:", bucket] -> f (T.pack bucket) file
     ["s3:", bucket, prefix] -> f (T.pack bucket) $ prefix </> file
-    _ -> monadThrow $ userError $ "Failed to parse S3 path: " ++ T.unpack url
+    _ -> throwM $ userError $ "Failed to parse S3 path: " ++ T.unpack url
 
 awsRetry :: (MonadIO m, Aws.Transaction r a)
          => Aws.Configuration
@@ -204,13 +203,13 @@ awsRetry cfg svcfg mgr r =
     isLeft Left{} = True
     isLeft Right{} = False
 
-downloadFromS3 :: MonadResource m
+downloadFromS3 :: (MonadResource m, MonadThrow m)
                => Aws.Configuration
                -> Aws.S3Configuration Aws.NormalQuery
                -> Manager
                -> Aws.Bucket
                -> String
-               -> Source m ByteString
+               -> ConduitT () ByteString m ()
 downloadFromS3 cfg svccfg mgr bucket file = withS3 bucket file go where
     go bucket' (T.pack -> file') = do
         res  <- liftResourceT $
@@ -218,18 +217,15 @@ downloadFromS3 cfg svccfg mgr bucket file = withS3 bucket file go where
         case Aws.readResponse res of
             Left (_ :: SomeException) -> return ()
             Right gor -> do
-                -- jww (2013-11-20): What to do with fin?
-                (src, _fin) <- liftResourceT $ unwrapResumable $
-                    responseBody (Aws.gorResponse gor)
-                hoist liftResourceT src
+                transPipe liftResourceT $ responseBody (Aws.gorResponse gor)
 
-download :: (MonadResource m, MonadBaseControl IO m, MonadThrow m)
+download ::  (MonadResource m, MonadThrow m)
          => Aws.Configuration
          -> Aws.S3Configuration Aws.NormalQuery
          -> Manager
          -> String               -- ^ The server path, like /tmp/foo
          -> String               -- ^ The file's path within the server path
-         -> Source m ByteString
+         -> ConduitT () ByteString m ()
 download _ _ mgr path@(pathKind -> UrlPath) =
     downloadFromUrl mgr path
 download cfg svccfg mgr path@(pathKind -> S3Path) =
@@ -237,11 +233,11 @@ download cfg svccfg mgr path@(pathKind -> S3Path) =
 download _ _ _ path = downloadFromPath path
 
 uploadToPath :: MonadResource m
-             => String -> String -> Source m ByteString -> m ()
+             => String -> String -> ConduitT () ByteString m () -> m ()
 uploadToPath path file src = do
     let p = path </> file
     liftIO $ createDirectoryIfMissing True (takeDirectory p)
-    src $$ CB.sinkFile p
+    runConduit $ src .| CB.sinkFile p
 
 uploadToS3 :: (MonadResource m, m ~ ResourceT IO)
            => Aws.Configuration
@@ -249,11 +245,11 @@ uploadToS3 :: (MonadResource m, m ~ ResourceT IO)
            -> Manager
            -> Aws.Bucket
            -> String
-           -> Source m ByteString
+           -> ConduitT () ByteString m ()
            -> m ()
 uploadToS3 cfg svccfg mgr bucket file src = withS3 bucket file go where
     go bucket' (T.pack -> file') = do
-        lbs <- src $$ CB.sinkLbs
+        lbs <- runConduit $ src .| CB.sinkLbs
         res <- awsRetry cfg svccfg mgr $
             Aws.putObject bucket' file' (RequestBodyLBS lbs)
         -- Reading the response triggers an exception if one occurred during
@@ -266,17 +262,19 @@ upload :: (MonadResource m, m ~ ResourceT IO)
        -> Manager
        -> String
        -> String
-       -> Source m ByteString
+       -> ConduitT () ByteString m ()
        -> m ()
 upload cfg svccfg mgr path@(pathKind -> S3Path) =
     uploadToS3 cfg svccfg mgr (T.pack path)
 upload _ _ _ path = uploadToPath path
 
 -- | Mirror Hackage using the supplied Options.
-mirrorHackage :: (MonadMask m,MonadIO m,MonadLogger m,CL.MonadActive m,MonadBaseControl IO m) => Options -> m ()
+mirrorHackage :: (MonadMask m,MonadIO m,MonadLogger m,CL.MonadActive m,MonadBaseControl IO m) =>
+  Options -> m ()
 mirrorHackage Options {..} = do
     ref <- liftIO (newIORef [])
-    cfg <- mkCfg ref
+    _cfg <- mkCfg ref
+    let cfg = _cfg Nothing
     mgr <- liftIO $ newManager tlsManagerSettings
     runResourceT $ do
         sums <- getChecksums cfg mgr
@@ -291,11 +289,10 @@ mirrorHackage Options {..} = do
   where
     go cfg mgr sums newSums changed = withTemp "index" $ \temp -> do
         $(logInfo) [st|Downloading index.tar.gz from #{from}|]
-        download cfg svccfg mgr from "00-index.tar.gz" $$ CB.sinkFile temp
+        runConduit $ download cfg svccfg mgr from "00-index.tar.gz" .| CB.sinkFile temp
 
-        getEntries cfg mgr temp
-            $$ processEntries cfg mgr sums newSums changed
-            $= CL.sinkNull
+        runConduit $ getEntries cfg mgr temp
+            .| (processEntries cfg mgr sums newSums changed $= CL.sinkNull) 
 
         -- Writing the tarball is what causes the changed bit to be
         -- calculated, so we write it first to a temp file and then only
@@ -353,7 +350,7 @@ mirrorHackage Options {..} = do
         return eres
 
     getChecksums cfg mgr = do
-        sums <- download cfg svccfg mgr to "00-checksums.dat" $$ CB.sinkLbs
+        sums <- runConduit $ download cfg svccfg mgr to "00-checksums.dat" .| CB.sinkLbs
         $(logInfo) [st|Downloaded checksums.dat from #{to}|]
         return $ if BL.null sums
                  then M.empty
